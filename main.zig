@@ -1,6 +1,10 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
+// ============================================================================
+// Funciones C / POSIX y Wrappers Multiplataforma
+// ============================================================================
+
 extern "c" fn _read(fd: c_int, buffer: [*]u8, count: c_uint) c_int;
 extern "c" fn _write(fd: c_int, buffer: [*]const u8, count: c_uint) c_int;
 extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
@@ -21,6 +25,10 @@ fn writeStdout(msg: []const u8) void {
     }
 }
 
+// ============================================================================
+// Tipos y Estructuras de Configuración y Telemetría
+// ============================================================================
+
 const ModelConfig = struct {
     id: []const u8,
     name: []const u8,
@@ -28,34 +36,35 @@ const ModelConfig = struct {
     model: []const u8,
     endpoint: ?[]const u8 = null,
     api_key_env: ?[]const u8 = null,
+    api_key: ?[]const u8 = null,
+    api_keys: ?[][]const u8 = null,
 };
 
 const AppConfig = struct {
     ollama_url: []const u8 = "http://127.0.0.1:11434",
-    default_model: []const u8 = "llama3.2",
+    default_model: []const u8 = "qwen2.5-coder:7b",
+    fallback_chain: [][]const u8 = &.{},
     models: []ModelConfig = &.{},
 };
 
-// ============================================================================
-// Utilidades JSON y Ejecución HTTP (Curl)
-// ============================================================================
+const CallResult = struct {
+    text: []u8,
+    prompt_tokens: u64 = 0,
+    completion_tokens: u64 = 0,
+    http_status: u16 = 200,
+    success: bool = false,
+    model_name: []const u8 = "",
+};
 
-fn escapeJson(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
-    var out: std.ArrayList(u8) = .empty;
-    defer out.deinit(allocator);
+// Estadísticas de consumo de la sesión
+var stat_calls_count: u64 = 0;
+var stat_prompt_tokens: u64 = 0;
+var stat_completion_tokens: u64 = 0;
+var stat_fallbacks_count: u64 = 0;
 
-    for (input) |c| {
-        switch (c) {
-            '\"' => try out.appendSlice(allocator, "\\\""),
-            '\\' => try out.appendSlice(allocator, "\\\\"),
-            '\n' => try out.appendSlice(allocator, "\\n"),
-            '\r' => try out.appendSlice(allocator, "\\r"),
-            '\t' => try out.appendSlice(allocator, "\\t"),
-            else => try out.append(allocator, c),
-        }
-    }
-    return try out.toOwnedSlice(allocator);
-}
+// ============================================================================
+// Rutas de Configuración Dinámica
+// ============================================================================
 
 fn getConfigPath() []const u8 {
     if (getenv("CONFIG_PATH")) |env_path| {
@@ -89,23 +98,68 @@ fn loadConfig(allocator: std.mem.Allocator, io: std.Io) !std.json.Parsed(AppConf
     }
 
     std.debug.print("[Bridge-Zig] No se encontró config.json, usando valores por defecto\n", .{});
-    const fallback = "{\"ollama_url\":\"http://127.0.0.1:11434\",\"default_model\":\"llama3.2\",\"models\":[]}";
+    const fallback = "{\"ollama_url\":\"http://127.0.0.1:11434\",\"default_model\":\"qwen2.5-coder:7b\",\"fallback_chain\":[],\"models\":[]}";
     return try std.json.parseFromSlice(AppConfig, allocator, fallback, .{ .ignore_unknown_fields = true, .allocate = .alloc_always });
 }
 
-fn executeHttp(allocator: std.mem.Allocator, io: std.Io, argv: []const []const u8) ![]u8 {
+// ============================================================================
+// Utilidades JSON y Ejecución HTTP con Detección de Estado
+// ============================================================================
+
+fn escapeJson(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(allocator);
+
+    for (input) |c| {
+        switch (c) {
+            '\"' => try out.appendSlice(allocator, "\\\""),
+            '\\' => try out.appendSlice(allocator, "\\\\"),
+            '\n' => try out.appendSlice(allocator, "\\n"),
+            '\r' => try out.appendSlice(allocator, "\\r"),
+            '\t' => try out.appendSlice(allocator, "\\t"),
+            else => try out.append(allocator, c),
+        }
+    }
+    return try out.toOwnedSlice(allocator);
+}
+
+fn executeHttpWithStatus(allocator: std.mem.Allocator, io: std.Io, argv: []const []const u8) !struct { body: []u8, http_code: u16 } {
+    var full_argv: std.ArrayList([]const u8) = .empty;
+    defer full_argv.deinit(allocator);
+
+    try full_argv.appendSlice(allocator, argv);
+    try full_argv.appendSlice(allocator, &[_][]const u8{ "-w", "\nHTTP_STATUS:%{http_code}" });
+
     const res = try std.process.run(allocator, io, .{
-        .argv = argv,
+        .argv = full_argv.items,
     });
     defer allocator.free(res.stderr);
-    return res.stdout;
+
+    const stdout = res.stdout;
+    defer allocator.free(stdout);
+
+    const marker = "\nHTTP_STATUS:";
+    if (std.mem.lastIndexOf(u8, stdout, marker)) |idx| {
+        const body_part = stdout[0..idx];
+        const code_str = std.mem.trim(u8, stdout[idx + marker.len ..], " \r\n");
+        const http_code = std.fmt.parseInt(u16, code_str, 10) catch 0;
+        return .{
+            .body = try allocator.dupe(u8, body_part),
+            .http_code = http_code,
+        };
+    }
+
+    return .{
+        .body = try allocator.dupe(u8, stdout),
+        .http_code = 0,
+    };
 }
 
 // ============================================================================
-// Consultas a Modelos (Ollama y OpenAI-Compatible)
+// Consultas Núcleo a Modelos (Ollama y OpenAI) con Telemetría
 // ============================================================================
 
-fn callOllama(allocator: std.mem.Allocator, io: std.Io, ollama_url: []const u8, model: []const u8, prompt: []const u8) ![]u8 {
+fn callOllamaCore(allocator: std.mem.Allocator, io: std.Io, ollama_url: []const u8, model: []const u8, prompt: []const u8) !CallResult {
     const endpoint = try std.fmt.allocPrint(allocator, "{s}/api/generate", .{ollama_url});
     defer allocator.free(endpoint);
 
@@ -121,50 +175,78 @@ fn callOllama(allocator: std.mem.Allocator, io: std.Io, ollama_url: []const u8, 
         "-d", payload,
     };
 
-    const stdout = try executeHttp(allocator, io, &argv);
-    defer allocator.free(stdout);
+    const http_res = try executeHttpWithStatus(allocator, io, &argv);
+    defer allocator.free(http_res.body);
 
-    if (stdout.len == 0) {
-        return try allocator.dupe(u8, "Error: Ollama no devolvió respuesta. Verifica que 'ollama serve' esté en ejecución.");
+    if (http_res.http_code != 200) {
+        return CallResult{
+            .text = try std.fmt.allocPrint(allocator, "Error HTTP {d} en Ollama ({s})", .{ http_res.http_code, http_res.body }),
+            .http_status = http_res.http_code,
+            .success = false,
+            .model_name = model,
+        };
     }
 
-    // Parsear campo "response"
-    const parsed = std.json.parseFromSlice(std.json.Value, allocator, stdout, .{}) catch {
-        return try allocator.dupe(u8, stdout);
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, http_res.body, .{}) catch {
+        return CallResult{
+            .text = try allocator.dupe(u8, http_res.body),
+            .http_status = http_res.http_code,
+            .success = true,
+            .model_name = model,
+        };
     };
     defer parsed.deinit();
 
+    var prompt_tok: u64 = 0;
+    var comp_tok: u64 = 0;
+
     if (parsed.value == .object) {
+        if (parsed.value.object.get("prompt_eval_count")) |pt| {
+            if (pt == .integer and pt.integer > 0) prompt_tok = @intCast(pt.integer);
+        }
+        if (parsed.value.object.get("eval_count")) |ct| {
+            if (ct == .integer and ct.integer > 0) comp_tok = @intCast(ct.integer);
+        }
         if (parsed.value.object.get("response")) |resp| {
             if (resp == .string) {
-                return try allocator.dupe(u8, resp.string);
+                return CallResult{
+                    .text = try allocator.dupe(u8, resp.string),
+                    .prompt_tokens = prompt_tok,
+                    .completion_tokens = comp_tok,
+                    .http_status = 200,
+                    .success = true,
+                    .model_name = model,
+                };
             }
         }
         if (parsed.value.object.get("error")) |err_val| {
             if (err_val == .string) {
-                return try std.fmt.allocPrint(allocator, "Error de Ollama: {s}", .{err_val.string});
+                return CallResult{
+                    .text = try std.fmt.allocPrint(allocator, "Error Ollama: {s}", .{err_val.string}),
+                    .http_status = 500,
+                    .success = false,
+                    .model_name = model,
+                };
             }
         }
     }
 
-    return try allocator.dupe(u8, stdout);
+    return CallResult{
+        .text = try allocator.dupe(u8, http_res.body),
+        .http_status = 200,
+        .success = true,
+        .model_name = model,
+    };
 }
 
-fn callOpenAI(allocator: std.mem.Allocator, io: std.Io, endpoint: []const u8, model: []const u8, api_key_env: ?[]const u8, prompt: []const u8) ![]u8 {
-    var auth_header: ?[]u8 = null;
-    defer if (auth_header) |h| allocator.free(h);
-
-    if (api_key_env) |env_name| {
-        // Encontrar valor de variable de entorno
-        var env_name_z: [256]u8 = undefined;
-        if (env_name.len < env_name_z.len) {
-            @memcpy(env_name_z[0..env_name.len], env_name);
-            env_name_z[env_name.len] = 0;
-            if (getenv(env_name_z[0..env_name.len :0])) |val| {
-                const key = std.mem.span(val);
-                auth_header = try std.fmt.allocPrint(allocator, "Authorization: Bearer {s}", .{key});
-            }
-        }
+fn callOpenAICore(allocator: std.mem.Allocator, io: std.Io, endpoint: []const u8, model: []const u8, keys: []const []const u8, prompt: []const u8) !CallResult {
+    if (keys.len == 0) {
+        return CallResult{
+            .text = try std.fmt.allocPrint(allocator, "Error: No se encontró ningún API Key/Token configurado para el modelo '{s}'.", .{model}),
+            .http_status = 401,
+            .success = false,
+            .model_name = model,
+        };
     }
 
     const escaped_prompt = try escapeJson(allocator, prompt);
@@ -173,57 +255,174 @@ fn callOpenAI(allocator: std.mem.Allocator, io: std.Io, endpoint: []const u8, mo
     const payload = try std.fmt.allocPrint(allocator, "{{\"model\":\"{s}\",\"messages\":[{{\"role\":\"user\",\"content\":\"{s}\"}}]}}", .{ model, escaped_prompt });
     defer allocator.free(payload);
 
-    var argv_list: std.ArrayList([]const u8) = .empty;
-    defer argv_list.deinit(allocator);
+    var last_status: u16 = 500;
+    var last_body: ?[]u8 = null;
+    defer if (last_body) |b| allocator.free(b);
 
-    try argv_list.appendSlice(allocator, &[_][]const u8{ "curl", "-s", "-X", "POST", endpoint, "-H", "Content-Type: application/json" });
-    if (auth_header) |h| {
-        try argv_list.appendSlice(allocator, &[_][]const u8{ "-H", h });
-    }
-    try argv_list.appendSlice(allocator, &[_][]const u8{ "-d", payload });
+    for (keys, 0..) |key, k_idx| {
+        var argv_list: std.ArrayList([]const u8) = .empty;
+        defer argv_list.deinit(allocator);
 
-    const stdout = try executeHttp(allocator, io, argv_list.items);
-    defer allocator.free(stdout);
+        const auth_header = try std.fmt.allocPrint(allocator, "Authorization: Bearer {s}", .{key});
+        defer allocator.free(auth_header);
 
-    if (stdout.len == 0) {
-        return try allocator.dupe(u8, "Error: Endpoint cloud no devolvió respuesta.");
-    }
+        try argv_list.appendSlice(allocator, &[_][]const u8{ "curl", "-s", "-X", "POST", endpoint, "-H", "Content-Type: application/json", "-H", auth_header, "-d", payload });
 
-    // Parsear campo "choices[0].message.content"
-    const parsed = std.json.parseFromSlice(std.json.Value, allocator, stdout, .{}) catch {
-        return try allocator.dupe(u8, stdout);
-    };
-    defer parsed.deinit();
+        const http_res = try executeHttpWithStatus(allocator, io, argv_list.items);
+        if (last_body) |b| allocator.free(b);
+        last_body = http_res.body;
+        last_status = http_res.http_code;
 
-    if (parsed.value == .object) {
-        if (parsed.value.object.get("choices")) |choices| {
-            if (choices == .array and choices.array.items.len > 0) {
-                const first = choices.array.items[0];
-                if (first == .object) {
-                    if (first.object.get("message")) |msg| {
-                        if (msg == .object) {
-                            if (msg.object.get("content")) |content| {
-                                if (content == .string) {
-                                    return try allocator.dupe(u8, content.string);
+        // Si falló por límite de cuota (429) o autorización (401) y hay más keys en el pool del mismo modelo:
+        if ((http_res.http_code == 429 or http_res.http_code == 401) and k_idx + 1 < keys.len) {
+            std.debug.print("[Bridge-Zig] ⚠️ Token #{d} de '{s}' devolvió HTTP {d}. Conmutando automáticamente al token #{d} del pool...\n", .{ k_idx + 1, model, http_res.http_code, k_idx + 2 });
+            stat_fallbacks_count += 1;
+            continue;
+        }
+
+        if (http_res.http_code != 200) {
+            return CallResult{
+                .text = try std.fmt.allocPrint(allocator, "HTTP {d} en Cloud ({s}): {s}", .{ http_res.http_code, model, http_res.body }),
+                .http_status = http_res.http_code,
+                .success = false,
+                .model_name = model,
+            };
+        }
+
+        const parsed = std.json.parseFromSlice(std.json.Value, allocator, http_res.body, .{}) catch {
+            return CallResult{
+                .text = try allocator.dupe(u8, http_res.body),
+                .http_status = 200,
+                .success = true,
+                .model_name = model,
+            };
+        };
+        defer parsed.deinit();
+
+        var prompt_tok: u64 = 0;
+        var comp_tok: u64 = 0;
+
+        if (parsed.value == .object) {
+            if (parsed.value.object.get("usage")) |usage| {
+                if (usage == .object) {
+                    if (usage.object.get("prompt_tokens")) |pt| {
+                        if (pt == .integer and pt.integer > 0) prompt_tok = @intCast(pt.integer);
+                    }
+                    if (usage.object.get("completion_tokens")) |ct| {
+                        if (ct == .integer and ct.integer > 0) comp_tok = @intCast(ct.integer);
+                    }
+                }
+            }
+
+            if (parsed.value.object.get("choices")) |choices| {
+                if (choices == .array and choices.array.items.len > 0) {
+                    const first = choices.array.items[0];
+                    if (first == .object) {
+                        if (first.object.get("message")) |msg| {
+                            if (msg == .object) {
+                                if (msg.object.get("content")) |content| {
+                                    if (content == .string) {
+                                        return CallResult{
+                                            .text = try allocator.dupe(u8, content.string),
+                                            .prompt_tokens = prompt_tok,
+                                            .completion_tokens = comp_tok,
+                                            .http_status = 200,
+                                            .success = true,
+                                            .model_name = model,
+                                        };
+                                    }
                                 }
                             }
                         }
                     }
                 }
             }
-        }
-        if (parsed.value.object.get("error")) |err_val| {
-            if (err_val == .object) {
-                if (err_val.object.get("message")) |msg| {
-                    if (msg == .string) {
-                        return try std.fmt.allocPrint(allocator, "Error API Cloud: {s}", .{msg.string});
+
+            if (parsed.value.object.get("error")) |err_val| {
+                if (err_val == .object) {
+                    if (err_val.object.get("message")) |msg| {
+                        if (msg == .string) {
+                            return CallResult{
+                                .text = try std.fmt.allocPrint(allocator, "Error API Cloud: {s}", .{msg.string}),
+                                .http_status = 400,
+                                .success = false,
+                                .model_name = model,
+                            };
+                        }
                     }
                 }
             }
         }
+
+        return CallResult{
+            .text = try allocator.dupe(u8, http_res.body),
+            .http_status = 200,
+            .success = true,
+            .model_name = model,
+        };
     }
 
-    return try allocator.dupe(u8, stdout);
+    return CallResult{
+        .text = try std.fmt.allocPrint(allocator, "HTTP {d} en Cloud ({s}): {s}", .{ last_status, model, if (last_body) |b| b else "Sin respuesta" }),
+        .http_status = last_status,
+        .success = false,
+        .model_name = model,
+    };
+}
+
+fn callModelById(allocator: std.mem.Allocator, io: std.Io, config: *const AppConfig, model_id: []const u8, prompt: []const u8) !CallResult {
+    for (config.models) |m| {
+        if (std.mem.eql(u8, m.id, model_id)) {
+            if (std.mem.eql(u8, m.provider, "ollama")) {
+                const url = m.endpoint orelse config.ollama_url;
+                return try callOllamaCore(allocator, io, url, m.model, prompt);
+            } else if (std.mem.eql(u8, m.provider, "openai")) {
+                const endpoint = m.endpoint orelse return CallResult{
+                    .text = try allocator.dupe(u8, "Modelo sin endpoint configurado."),
+                    .http_status = 400,
+                    .success = false,
+                    .model_name = m.model,
+                };
+
+                var keys_list: std.ArrayList([]const u8) = .empty;
+                defer keys_list.deinit(allocator);
+
+                if (m.api_keys) |ks| {
+                    for (ks) |k| {
+                        const trimmed = std.mem.trim(u8, k, " \t\r\n");
+                        if (trimmed.len > 0) try keys_list.append(allocator, trimmed);
+                    }
+                }
+                if (m.api_key) |k| {
+                    var it = std.mem.splitScalar(u8, k, ',');
+                    while (it.next()) |part| {
+                        const trimmed = std.mem.trim(u8, part, " \t\r\n");
+                        if (trimmed.len > 0) try keys_list.append(allocator, trimmed);
+                    }
+                }
+                if (m.api_key_env) |env_name| {
+                    var env_name_z: [256]u8 = undefined;
+                    if (env_name.len < env_name_z.len) {
+                        @memcpy(env_name_z[0..env_name.len], env_name);
+                        env_name_z[env_name.len] = 0;
+                        if (getenv(env_name_z[0..env_name.len :0])) |val| {
+                            const raw_val = std.mem.span(val);
+                            var it = std.mem.splitScalar(u8, raw_val, ',');
+                            while (it.next()) |part| {
+                                const trimmed = std.mem.trim(u8, part, " \t\r\n");
+                                if (trimmed.len > 0) try keys_list.append(allocator, trimmed);
+                            }
+                        }
+                    }
+                }
+
+                return try callOpenAICore(allocator, io, endpoint, m.model, keys_list.items, prompt);
+            }
+        }
+    }
+
+    // Si no está registrado en models, llamada directa a Ollama con ese id como modelo
+    return try callOllamaCore(allocator, io, config.ollama_url, model_id, prompt);
 }
 
 // ============================================================================
@@ -237,20 +436,31 @@ fn handleAskOllama(allocator: std.mem.Allocator, io: std.Io, args: std.json.Valu
     const prompt_val = if (args == .object) args.object.get("prompt") else null;
     const prompt = if (prompt_val) |p| (if (p == .string) p.string else "") else "";
 
-    if (prompt.len == 0) {
-        return try allocator.dupe(u8, "Error: Debes proporcionar un 'prompt'.");
-    }
+    if (prompt.len == 0) return try allocator.dupe(u8, "Error: Debes proporcionar un 'prompt'.");
 
     var model = config_parsed.value.default_model;
     if (args == .object) {
         if (args.object.get("model")) |m| {
-            if (m == .string and m.string.len > 0) {
-                model = m.string;
-            }
+            if (m == .string and m.string.len > 0) model = m.string;
         }
     }
 
-    return try callOllama(allocator, io, config_parsed.value.ollama_url, model, prompt);
+    const res = try callOllamaCore(allocator, io, config_parsed.value.ollama_url, model, prompt);
+    defer allocator.free(res.text);
+
+    if (res.success) {
+        stat_calls_count += 1;
+        stat_prompt_tokens += res.prompt_tokens;
+        stat_completion_tokens += res.completion_tokens;
+
+        return try std.fmt.allocPrint(
+            allocator,
+            "{s}\n\n---\n📊 **Telemetría:** `Ollama ({s})` | Tokens: {d} (Entrada: {d}, Salida: {d})",
+            .{ res.text, model, res.prompt_tokens + res.completion_tokens, res.prompt_tokens, res.completion_tokens },
+        );
+    } else {
+        return try allocator.dupe(u8, res.text);
+    }
 }
 
 fn handleAskModel(allocator: std.mem.Allocator, io: std.Io, args: std.json.Value) ![]u8 {
@@ -267,23 +477,120 @@ fn handleAskModel(allocator: std.mem.Allocator, io: std.Io, args: std.json.Value
         return try allocator.dupe(u8, "Error: Debes proporcionar 'model_id' y 'prompt'.");
     }
 
-    // Buscar en los modelos configurados
-    for (config_parsed.value.models) |m| {
-        if (std.mem.eql(u8, m.id, model_id)) {
-            if (std.mem.eql(u8, m.provider, "ollama")) {
-                const url = m.endpoint orelse config_parsed.value.ollama_url;
-                return try callOllama(allocator, io, url, m.model, prompt);
-            } else if (std.mem.eql(u8, m.provider, "openai")) {
-                const endpoint = m.endpoint orelse return try allocator.dupe(u8, "Error: El modelo OpenAI no tiene 'endpoint' configurado.");
-                return try callOpenAI(allocator, io, endpoint, m.model, m.api_key_env, prompt);
-            } else {
-                return try std.fmt.allocPrint(allocator, "Error: Proveedor desconocido '{s}'.", .{m.provider});
-            }
+    const res = try callModelById(allocator, io, &config_parsed.value, model_id, prompt);
+    defer allocator.free(res.text);
+
+    if (res.success) {
+        stat_calls_count += 1;
+        stat_prompt_tokens += res.prompt_tokens;
+        stat_completion_tokens += res.completion_tokens;
+
+        return try std.fmt.allocPrint(
+            allocator,
+            "{s}\n\n---\n📊 **Telemetría:** Modelo `{s}` | Tokens: {d} (Entrada: {d}, Salida: {d})",
+            .{ res.text, res.model_name, res.prompt_tokens + res.completion_tokens, res.prompt_tokens, res.completion_tokens },
+        );
+    } else {
+        return try allocator.dupe(u8, res.text);
+    }
+}
+
+fn handleAskResilient(allocator: std.mem.Allocator, io: std.Io, args: std.json.Value) ![]u8 {
+    const config_parsed = try loadConfig(allocator, io);
+    defer config_parsed.deinit();
+
+    const prompt_val = if (args == .object) args.object.get("prompt") else null;
+    const prompt = if (prompt_val) |p| (if (p == .string) p.string else "") else "";
+
+    if (prompt.len == 0) return try allocator.dupe(u8, "Error: Debes proporcionar un 'prompt'.");
+
+    const initial_model_val = if (args == .object) args.object.get("initial_model") else null;
+    const initial_model = if (initial_model_val) |m| (if (m == .string and m.string.len > 0) m.string else null) else null;
+
+    // Construir lista de candidatos
+    var candidates: std.ArrayList([]const u8) = .empty;
+    defer candidates.deinit(allocator);
+
+    if (initial_model) |im| {
+        try candidates.append(allocator, im);
+    }
+
+    for (config_parsed.value.fallback_chain) |fc| {
+        if (initial_model == null or !std.mem.eql(u8, fc, initial_model.?)) {
+            try candidates.append(allocator, fc);
         }
     }
 
-    // Si no está en models, pero coincide con default_model o es una llamada directa a Ollama
-    return try callOllama(allocator, io, config_parsed.value.ollama_url, model_id, prompt);
+    // Si la cadena está vacía, usar modelos disponibles por defecto
+    if (candidates.items.len == 0) {
+        for (config_parsed.value.models) |m| {
+            try candidates.append(allocator, m.id);
+        }
+    }
+
+    var history_log: std.ArrayList(u8) = .empty;
+    defer history_log.deinit(allocator);
+
+    for (candidates.items) |cand_id| {
+        std.debug.print("[Bridge-Zig] Intentando modelo '{s}'...\n", .{cand_id});
+        const res = callModelById(allocator, io, &config_parsed.value, cand_id, prompt) catch |err| CallResult{
+            .text = try std.fmt.allocPrint(allocator, "Error interno: {any}", .{err}),
+            .http_status = 500,
+            .success = false,
+            .model_name = cand_id,
+        };
+        defer allocator.free(res.text);
+
+        if (res.success) {
+            stat_calls_count += 1;
+            stat_prompt_tokens += res.prompt_tokens;
+            stat_completion_tokens += res.completion_tokens;
+
+            const fallback_note = if (history_log.items.len > 0)
+                try std.fmt.allocPrint(allocator, "\n🔄 *Conmutación automática (Fallback): {s}*✅ Exitoso en `{s}`", .{ history_log.items, cand_id })
+            else
+                try allocator.dupe(u8, "");
+            defer allocator.free(fallback_note);
+
+            return try std.fmt.allocPrint(
+                allocator,
+                "{s}\n\n---\n📊 **Telemetría:** Modelo `{s}` ({s}) | Tokens: {d} (Entrada: {d}, Salida: {d}){s}",
+                .{ res.text, cand_id, res.model_name, res.prompt_tokens + res.completion_tokens, res.prompt_tokens, res.completion_tokens, fallback_note },
+            );
+        } else {
+            stat_fallbacks_count += 1;
+            std.debug.print("[Bridge-Zig] ⚠️ '{s}' falló (HTTP {d}). Pasando al siguiente modelo en cadena...\n", .{ cand_id, res.http_status });
+            const log_entry = try std.fmt.allocPrint(allocator, "`{s}` (HTTP {d}) ➔ ", .{ cand_id, res.http_status });
+            defer allocator.free(log_entry);
+            try history_log.appendSlice(allocator, log_entry);
+        }
+    }
+
+    return try std.fmt.allocPrint(
+        allocator,
+        "❌ **Error:** Todos los modelos en la cadena de fallback fallaron.\n\nHistorial de intentos:\n{s}(fin de cadena)",
+        .{history_log.items},
+    );
+}
+
+fn handleGetStats(allocator: std.mem.Allocator) ![]u8 {
+    return try std.fmt.allocPrint(
+        allocator,
+        "📊 **Telemetría y Consumo Acumulado (Sesión Actual):**\n\n" ++
+            "• **Total de Peticiones Procesadas:** {d}\n" ++
+            "• **Conmutaciones Automáticas (Fallbacks):** {d}\n" ++
+            "• **Tokens de Entrada (Prompt):** {d}\n" ++
+            "• **Tokens de Salida (Generación):** {d}\n" ++
+            "• **Total de Tokens Acumulados:** {d}\n\n" ++
+            "💡 *Tip de Co-work:* Para tareas masivas o desatendidas, usa `ask_resilient`. Si un proveedor en la nube llega a su límite de cuota (Rate Limit 429), el puente conmuta automáticamente al siguiente sin parar el flujo.",
+        .{
+            stat_calls_count,
+            stat_fallbacks_count,
+            stat_prompt_tokens,
+            stat_completion_tokens,
+            stat_prompt_tokens + stat_completion_tokens,
+        },
+    );
 }
 
 fn handleListModels(allocator: std.mem.Allocator, io: std.Io) ![]u8 {
@@ -293,15 +600,26 @@ fn handleListModels(allocator: std.mem.Allocator, io: std.Io) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(allocator);
 
-    try out.appendSlice(allocator, "🤖 Modelos Disponibles en config.json:\n\n");
-    const header = try std.fmt.allocPrint(allocator, "• [Predeterminado Ollama]: {s} (URL: {s})\n\n", .{ config_parsed.value.default_model, config_parsed.value.ollama_url });
+    try out.appendSlice(allocator, "🤖 **Modelos Registrados en config.json:**\n\n");
+    const header = try std.fmt.allocPrint(allocator, "• **Ollama Local Predeterminado:** `{s}` (URL: {s})\n\n", .{ config_parsed.value.default_model, config_parsed.value.ollama_url });
     defer allocator.free(header);
     try out.appendSlice(allocator, header);
 
+    if (config_parsed.value.fallback_chain.len > 0) {
+        try out.appendSlice(allocator, "🔄 **Cadena de Conmutación Automática (Fallback):**\n");
+        for (config_parsed.value.fallback_chain, 0..) |fc, i| {
+            const arrow = if (i + 1 < config_parsed.value.fallback_chain.len) " ➔ " else "\n\n";
+            const piece = try std.fmt.allocPrint(allocator, "`{s}`{s}", .{ fc, arrow });
+            defer allocator.free(piece);
+            try out.appendSlice(allocator, piece);
+        }
+    }
+
+    try out.appendSlice(allocator, "📋 **Catálogo de Modelos:**\n");
     for (config_parsed.value.models, 1..) |m, idx| {
         const item = try std.fmt.allocPrint(
             allocator,
-            "{d}. ID: `{s}` | Nombre: {s}\n   - Proveedor: {s}\n   - Modelo API: {s}\n   - Endpoint: {s}\n\n",
+            "{d}. ID: `{s}` | Nombre: **{s}**\n   - Proveedor: {s}\n   - Modelo API: `{s}`\n   - Endpoint: {s}\n\n",
             .{ idx, m.id, m.name, m.provider, m.model, m.endpoint orelse "(default)" },
         );
         defer allocator.free(item);
@@ -312,9 +630,7 @@ fn handleListModels(allocator: std.mem.Allocator, io: std.Io) ![]u8 {
 }
 
 fn handleAddModel(allocator: std.mem.Allocator, io: std.Io, args: std.json.Value) ![]u8 {
-    if (args != .object) {
-        return try allocator.dupe(u8, "Error: argumentos inválidos.");
-    }
+    if (args != .object) return try allocator.dupe(u8, "Error: argumentos inválidos.");
 
     const id_val = args.object.get("id") orelse return try allocator.dupe(u8, "Falta 'id'");
     const name_val = args.object.get("name") orelse id_val;
@@ -322,6 +638,7 @@ fn handleAddModel(allocator: std.mem.Allocator, io: std.Io, args: std.json.Value
     const model_val = args.object.get("model") orelse return try allocator.dupe(u8, "Falta 'model'");
     const endpoint_val = args.object.get("endpoint");
     const env_val = args.object.get("api_key_env");
+    const direct_key_val = args.object.get("api_key");
 
     if (id_val != .string or provider_val != .string or model_val != .string) {
         return try allocator.dupe(u8, "Error: tipos de argumentos inválidos.");
@@ -355,6 +672,9 @@ fn handleAddModel(allocator: std.mem.Allocator, io: std.Io, args: std.json.Value
     if (env_val) |ev| {
         if (ev == .string) try new_model_obj.put(allocator, "api_key_env", .{ .string = ev.string });
     }
+    if (direct_key_val) |dk| {
+        if (dk == .string) try new_model_obj.put(allocator, "api_key", .{ .string = dk.string });
+    }
 
     try models_ptr.?.*.array.append(.{ .object = new_model_obj });
 
@@ -385,10 +705,12 @@ fn handleToolsList(allocator: std.mem.Allocator, id_json: []const u8) !void {
     const tools_json = try std.fmt.allocPrint(
         allocator,
         \\{{"jsonrpc":"2.0","id":{s},"result":{{"tools":[
-        \\{{"name":"ask_ollama","description":"Consulta un modelo local corriendo en Ollama (ej: llama3.2, deepseek-r1, qwen2.5-coder).","inputSchema":{{"type":"object","properties":{{"prompt":{{"type":"string","description":"Mensaje o pregunta para el modelo."}},"model":{{"type":"string","description":"Nombre del modelo de Ollama (opcional, usa el predeterminado si se omite)."}}}},"required":["prompt"]}}}},
-        \\{{"name":"ask_model","description":"Consulta cualquiera de los modelos configurados en config.json por su ID o alias (locales o en la nube).","inputSchema":{{"type":"object","properties":{{"model_id":{{"type":"string","description":"ID del modelo registrado (ej: 'llama3.2', 'groq', 'cerebras', 'deepseek', etc.)."}},"prompt":{{"type":"string","description":"Mensaje o instrucción para el modelo."}}}},"required":["model_id","prompt"]}}}},
-        \\{{"name":"list_models","description":"Lista todos los modelos configurados actualmente en config.json con sus proveedores.","inputSchema":{{"type":"object","properties":{{}}}}}},
-        \\{{"name":"add_model","description":"Agrega un nuevo modelo a config.json dinámicamente sin reiniciar ni recompilar.","inputSchema":{{"type":"object","properties":{{"id":{{"type":"string","description":"ID único del modelo (ej: 'mi-llama', 'groq-mixtral')."}},"name":{{"type":"string","description":"Nombre descriptivo."}},"provider":{{"type":"string","description":"'ollama' o 'openai'."}},"model":{{"type":"string","description":"Nombre real del modelo en la API."}},"endpoint":{{"type":"string","description":"URL del endpoint (opcional para Ollama, obligatoria para APIs OpenAI-compatibles)."}},"api_key_env":{{"type":"string","description":"Nombre de la variable de entorno con el API key (opcional)."}}}},"required":["id","provider","model"]}}}}
+        \\{{"name":"ask_resilient","description":"Ejecuta peticiones con conmutación automática de modelos (Auto-Fallback). Si un proveedor falla o agota su límite de cuota (Rate Limit 429), conmuta automáticamente al siguiente hasta completarla.","inputSchema":{{"type":"object","properties":{{"prompt":{{"type":"string","description":"Instrucción o tarea a procesar."}},"initial_model":{{"type":"string","description":"Modelo inicial sugerido (opcional, ej: 'groq')."}}}},"required":["prompt"]}}}},
+        \\{{"name":"ask_ollama","description":"Consulta un modelo local en Ollama (ej: qwen2.5-coder:7b, deepseek-r1:8b, llama3.2). Muestra tokens consumidos.","inputSchema":{{"type":"object","properties":{{"prompt":{{"type":"string","description":"Mensaje o pregunta para el modelo."}},"model":{{"type":"string","description":"Nombre del modelo de Ollama (opcional, usa el predeterminado si se omite)."}}}},"required":["prompt"]}}}},
+        \\{{"name":"ask_model","description":"Consulta un modelo específico configurado en config.json por su ID (ej: 'groq', 'cerebras', 'gemini'). Muestra tokens consumidos.","inputSchema":{{"type":"object","properties":{{"model_id":{{"type":"string","description":"ID del modelo registrado."}},"prompt":{{"type":"string","description":"Mensaje o instrucción para el modelo."}}}},"required":["model_id","prompt"]}}}},
+        \\{{"name":"get_stats","description":"Devuelve el consumo total acumulado de tokens (prompt, respuesta) y conmutaciones de fallback de la sesión.","inputSchema":{{"type":"object","properties":{{}}}}}},
+        \\{{"name":"list_models","description":"Lista todos los modelos configurados en config.json y el orden de la cadena de fallback.","inputSchema":{{"type":"object","properties":{{}}}}}},
+        \\{{"name":"add_model","description":"Agrega un nuevo modelo a config.json dinámicamente sin reiniciar ni recompilar.","inputSchema":{{"type":"object","properties":{{"id":{{"type":"string","description":"ID único del modelo (ej: 'mi-llama', 'groq-mixtral')."}},"name":{{"type":"string","description":"Nombre descriptivo."}},"provider":{{"type":"string","description":"'ollama' o 'openai'."}},"model":{{"type":"string","description":"Nombre real del modelo en la API."}},"endpoint":{{"type":"string","description":"URL del endpoint (opcional para Ollama, obligatoria para APIs OpenAI-compatibles)."}},"api_key_env":{{"type":"string","description":"Nombre de la variable de entorno con el API key (opcional)."}},"api_key":{{"type":"string","description":"API Key directa en config.json (opcional, alternativa a variable de entorno)."}}}},"required":["id","provider","model"]}}}}
         \\]}}}}
     ,
         .{id_json},
@@ -420,9 +742,7 @@ pub fn main() !void {
             }
 
             if (line.len > 0) {
-                // Parsear mensaje JSON-RPC
                 var parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch {
-                    // Descartar línea inválida
                     const rem_start = newline_idx + 1;
                     const rem_len = len - rem_start;
                     if (rem_len > 0) std.mem.copyForwards(u8, buf[0..rem_len], buf[rem_start..len]);
@@ -447,13 +767,13 @@ pub fn main() !void {
 
                             const resp = try std.fmt.allocPrint(
                                 allocator,
-                                "{{\"jsonrpc\":\"2.0\",\"id\":{s},\"result\":{{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{{\"tools\":{{}}}},\"serverInfo\":{{\"name\":\"antigravity-zig-bridge\",\"version\":\"1.0.0\"}}}}}}",
+                                "{{\"jsonrpc\":\"2.0\",\"id\":{s},\"result\":{{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{{\"tools\":{{}}}},\"serverInfo\":{{\"name\":\"antigravity-zig-bridge\",\"version\":\"2.0.0\"}}}}}}",
                                 .{id_str},
                             );
                             defer allocator.free(resp);
                             sendResponse(resp);
                         } else if (std.mem.eql(u8, method, "notifications/initialized")) {
-                            // ACK silencioso
+                            // ACK
                         } else if (std.mem.eql(u8, method, "ping")) {
                             if (id_val) |id| {
                                 const id_str = if (id == .integer) try std.fmt.allocPrint(allocator, "{d}", .{id.integer}) else try allocator.dupe(u8, "1");
@@ -488,7 +808,12 @@ pub fn main() !void {
                                 if (tool_name_val != null and tool_name_val.? == .string) {
                                     const tool_name = tool_name_val.?.string;
 
-                                    if (std.mem.eql(u8, tool_name, "ask_ollama")) {
+                                    if (std.mem.eql(u8, tool_name, "ask_resilient")) {
+                                        result_text = handleAskResilient(allocator, io, args_val) catch |err| blk: {
+                                            is_error = true;
+                                            break :blk try std.fmt.allocPrint(allocator, "Error ejecutando ask_resilient: {any}", .{err});
+                                        };
+                                    } else if (std.mem.eql(u8, tool_name, "ask_ollama")) {
                                         result_text = handleAskOllama(allocator, io, args_val) catch |err| blk: {
                                             is_error = true;
                                             break :blk try std.fmt.allocPrint(allocator, "Error ejecutando ask_ollama: {any}", .{err});
@@ -497,6 +822,11 @@ pub fn main() !void {
                                         result_text = handleAskModel(allocator, io, args_val) catch |err| blk: {
                                             is_error = true;
                                             break :blk try std.fmt.allocPrint(allocator, "Error ejecutando ask_model: {any}", .{err});
+                                        };
+                                    } else if (std.mem.eql(u8, tool_name, "get_stats")) {
+                                        result_text = handleGetStats(allocator) catch |err| blk: {
+                                            is_error = true;
+                                            break :blk try std.fmt.allocPrint(allocator, "Error ejecutando get_stats: {any}", .{err});
                                         };
                                     } else if (std.mem.eql(u8, tool_name, "list_models")) {
                                         result_text = handleListModels(allocator, io) catch |err| blk: {
@@ -537,7 +867,6 @@ pub fn main() !void {
                 }
             }
 
-            // Desplazar lo restante en el buffer
             const rem_start = newline_idx + 1;
             const rem_len = len - rem_start;
             if (rem_len > 0) {

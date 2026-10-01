@@ -1,6 +1,13 @@
 {
   "ollama_url": "http://127.0.0.1:11434",
   "default_model": "qwen2.5-coder:7b",
+  "fallback_chain": [
+    "groq",
+    "cerebras",
+    "gemini",
+    "codestral",
+    "qwen-local"
+  ],
   "models": [
     {
       "id": "qwen-local",
@@ -22,7 +29,7 @@
     },
     {
       "id": "groq",
-      "name": "Groq Llama 3.3 70B (Tribunal Cloud Ultra-Rápido)",
+      "name": "Groq Llama 3.3 70B (Cloud Ultra-Rápido)",
       "provider": "openai",
       "endpoint": "https://api.groq.com/openai/v1/chat/completions",
       "model": "llama-3.3-70b-versatile",
@@ -45,12 +52,28 @@
       "api_key_env": "GEMINI_API_KEY"
     },
     {
+      "id": "codestral",
+      "name": "Mistral Codestral 22B (Especialista en 80+ Lenguajes)",
+      "provider": "openai",
+      "endpoint": "https://api.mistral.ai/v1/chat/completions",
+      "model": "codestral-latest",
+      "api_key_env": "MISTRAL_API_KEY"
+    },
+    {
       "id": "openrouter-free",
       "name": "OpenRouter Qwen 2.5 Coder 32B (Cloud Freemium)",
       "provider": "openai",
-      "endpoint": "https://openrouter.ai/api/v1/chat/completions",
+      "endpoint": "https://api.openrouter.ai/api/v1/chat/completions",
       "model": "qwen/qwen-2.5-coder-32b-instruct:free",
       "api_key_env": "OPENROUTER_API_KEY"
+    },
+    {
+      "id": "github-gpt4o",
+      "name": "GitHub Models GPT-4o (Free con GitHub Token)",
+      "provider": "openai",
+      "endpoint": "https://models.inference.ai.azure.com/chat/completions",
+      "model": "gpt-4o",
+      "api_key_env": "GITHUB_TOKEN"
     }
   ]
 }
