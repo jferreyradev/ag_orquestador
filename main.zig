@@ -83,9 +83,12 @@ fn readConfigData(allocator: std.mem.Allocator, io: std.Io) ?[]u8 {
             if (cwd.readFileAlloc(io, path, allocator, .unlimited)) |d| return d else |_| {}
         }
     }
-    // 2. config.json en el directorio actual
+    // 2. config.local.json en el directorio actual (prioridad privada, ya en .gitignore)
+    if (cwd.readFileAlloc(io, "config.local.json", allocator, .unlimited)) |d| return d else |_| {}
+    // 3. config.json en el directorio actual
     if (cwd.readFileAlloc(io, "config.json", allocator, .unlimited)) |d| return d else |_| {}
-    // 3. config.json en el directorio padre (si el binario corre desde dist/)
+    // 4. Si el binario corre desde dist/ o subcarpeta
+    if (cwd.readFileAlloc(io, "../config.local.json", allocator, .unlimited)) |d| return d else |_| {}
     if (cwd.readFileAlloc(io, "../config.json", allocator, .unlimited)) |d| return d else |_| {}
 
     return null;

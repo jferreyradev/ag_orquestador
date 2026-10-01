@@ -34,30 +34,16 @@ mi_orquestador/
    ```
 3. Mantener Ollama ejecutándose (`ollama serve` o la app de escritorio).
 
-### Paso 2: Configuración de Claves API (Nube)
-Tienes **dos formas** de configurar tus API Keys de la nube:
+### Paso 2: Configuración de Claves API (Nube) — Dos Enfoques Claramente Separados
 
-#### Opción A (Recomendada): En el archivo MCP de Antigravity
-En `~/.gemini/config/mcp_config.json`:
-```json
-{
-  "mcpServers": {
-    "orquestador": {
-      "command": "/Users/jferreyradev/projects/ag/ag_orquestador/ag_bridge",
-      "args": [],
-      "env": {
-        "GROQ_API_KEY": "gsk_...",
-        "CEREBRAS_API_KEY": "csk-...",
-        "GEMINI_API_KEY": "AIzaSy...",
-        "OPENROUTER_API_KEY": "sk-or-..."
-      }
-    }
-  }
-}
-```
+Para configurar tus tokens de la nube tienes **dos caminos independientes**. Elige el que te resulte más cómodo:
 
-#### Opción B: Directamente en `config.json`
-Si prefieres no lidiar con variables de entorno del sistema, puedes poner la clave directa en cada modelo en `config.json`:
+---
+
+#### 🟢 ENFOQUE 1: Modo Directo en `config.json` (El Más Simple y Rápido)
+**No tocas variables de entorno ni archivos externos.** Pegas la clave alfanumérica directamente dentro de tu [config.json](file:///Users/jferreyradev/projects/ag/ag_orquestador/config.json).
+
+* **Si tienes 1 solo token para ese modelo:**
 ```json
 {
   "id": "groq",
@@ -65,9 +51,66 @@ Si prefieres no lidiar con variables de entorno del sistema, puedes poner la cla
   "provider": "openai",
   "endpoint": "https://api.groq.com/openai/v1/chat/completions",
   "model": "llama-3.3-70b-versatile",
-  "api_key": "gsk_..."
+  "api_key": "gsk_pega_aqui_tu_clave_real"
 }
 ```
+
+* **Si tienes 2 o más tokens de diferentes cuentas personales:**
+```json
+{
+  "id": "groq",
+  "name": "Groq Llama 3.3 70B (Pool Multi-Cuenta)",
+  "provider": "openai",
+  "endpoint": "https://api.groq.com/openai/v1/chat/completions",
+  "model": "llama-3.3-70b-versatile",
+  "api_keys": [
+    "gsk_token_cuenta_personal_1",
+    "gsk_token_cuenta_personal_2",
+    "gsk_token_cuenta_personal_3"
+  ]
+}
+```
+*(En este enfoque no hay ningún alias ni nombre que hacer coincidir: el puente toma el valor literal del archivo).*
+
+---
+
+#### 🔵 ENFOQUE 2: Modo Variables de Entorno en Antigravity (Para no guardar claves en el repo)
+Si no quieres que tus claves secretas queden escritas en `config.json`, las declaras en el archivo de Antigravity y las vinculas mediante **nombres de variable (alias)**.
+
+Aquí es donde **los nombres deben coincidir con exactitud**:
+
+```text
+┌────────────────────────────────────────────────────────────────────────┐
+│ ARCHIVO 1: ~/.gemini/config/mcp_config.json (Configuración de Antigravity)│
+│                                                                        │
+│ "env": {                                                               │
+│     "MI_TOKEN_GROQ_1": "gsk_cuenta1_abc123...", ──┐                    │
+│     "MI_TOKEN_GROQ_2": "gsk_cuenta2_xyz789..."  ──┼───────┐            │
+│ }                                                 │       │            │
+└───────────────────────────────────────────────────┼───────┼────────────┘
+                                                    │       │
+                                     ¡DEBEN COINCIDIR EXACTAMENTE!
+                                                    │       │
+┌───────────────────────────────────────────────────┼───────┼────────────┐
+│ ARCHIVO 2: config.json (Configuración de tu Orquestador)  │            │
+│                                                   │       │            │
+│ {                                                 │       │            │
+│   "id": "groq-cuenta-1",                          │       │            │
+│   "api_key_env": "MI_TOKEN_GROQ_1" <──────────────┘       │            │
+│ },                                                        │            │
+│ {                                                         │            │
+│   "id": "groq-cuenta-2",                                  │            │
+│   "api_key_env": "MI_TOKEN_GROQ_2" <──────────────────────┘            │
+│ }                                                                      │
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+> **Regla de Correspondencia:**  
+> Lo que pongas a la izquierda en `"env"` (el nombre que tú inventes para esa variable) debe ser **exactamente el mismo texto** que coloques dentro del campo `"api_key_env"` en `config.json`.
+
+* **Alternativa con Pool por Variable:** También puedes poner varios tokens separados por coma bajo una misma variable:
+  * En `mcp_config.json`: `"GROQ_API_KEY": "gsk_cuenta1...,gsk_cuenta2..."`
+  * En `config.json`: `"api_key_env": "GROQ_API_KEY"` (el puente separa automáticamente por comas).
 
 ---
 
@@ -171,9 +214,37 @@ La cadena por defecto configurada en `config.json` es:
   "groq",
   "cerebras",
   "gemini",
+  "codestral",
   "qwen-local"
 ]
 ```
+
+### 3.1. ¿Cómo definir y cambiar el orden de prioridad global?
+El orden en que escribes los IDs dentro de `"fallback_chain"` es **exactamente el orden de prioridad** de ejecución:
+1. `1°`: Primer elemento (`groq`).
+2. `2°`: Segundo elemento si el primero falla o llega al límite (`cerebras`).
+3. `3°`: Tercer elemento (`gemini`), y así sucesivamente.
+
+**Para cambiar la prioridad:** Simplemente reordena los elementos en [config.json](file:///Users/jferreyradev/projects/ag/ag_orquestador/config.json). No necesitas reiniciar Antigravity ni recompilar nada; el cambio toma efecto de inmediato.
+
+### 3.2. Cambiar la prioridad "al vuelo" en el chat (`initial_model`)
+Si para una tarea puntual quieres que comience con otro modelo (por ejemplo `gemini` o `cerebras`), pero manteniendo la red de seguridad del fallback si este falla:
+> *"Usa ask_resilient **empezando con gemini** para resolver este problema..."*
+
+El puente colocará a `gemini` en la posición #1 de la cola, y si este se satura o da HTTP 429, continuará con los demás modelos configurados en `fallback_chain`.
+
+### 3.3. Forzar un modelo específico (sin conmutación / sin fallback)
+Si quieres que una consulta se haga estrictamente con un modelo sin que salte a ningún otro:
+* **Para cualquier modelo del catálogo:** Usa `ask_model`:
+  > *"Pregúntale a **cerebras**..."* o *"Consulta a **codestral**..."*
+* **Para Ollama local:** Usa `ask_ollama`:
+  > *"Usa ask_ollama con **deepseek-r1:8b** para..."*
+
+### 3.4. Prioridad entre tokens de un mismo modelo (Multi-Token)
+Si configuraste un array `"api_keys": ["token_1", "token_2"]`, la prioridad es estrictamente de izquierda a derecha:
+1. Primero se usa el `token_1`.
+2. Si devuelve `HTTP 429` (Rate Limit) o `HTTP 401`, pasa de inmediato al `token_2`.
+3. Solo si todos los tokens del modelo fallan, se avanza al siguiente modelo de la `fallback_chain`.
 
 ---
 
