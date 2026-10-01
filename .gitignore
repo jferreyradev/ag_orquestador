@@ -1,0 +1,9 @@
+# Binarios compilados
+ag_bridge
+*.o
+zig-out/
+.zig-cache/
+
+# Archivos de entorno y configuraciones locales
+.env
+config.local.json

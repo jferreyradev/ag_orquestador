@@ -1,0 +1,56 @@
+{
+  "ollama_url": "http://127.0.0.1:11434",
+  "default_model": "qwen2.5-coder:7b",
+  "models": [
+    {
+      "id": "qwen-local",
+      "name": "Qwen 2.5 Coder 7B (Especialista Código Local)",
+      "provider": "ollama",
+      "model": "qwen2.5-coder:7b"
+    },
+    {
+      "id": "deepseek-local",
+      "name": "DeepSeek R1 8B (Razonador & Arquitectura Local)",
+      "provider": "ollama",
+      "model": "deepseek-r1:8b"
+    },
+    {
+      "id": "llama-local",
+      "name": "Llama 3.2 3B (Asistente Rápido Co-work Local)",
+      "provider": "ollama",
+      "model": "llama3.2"
+    },
+    {
+      "id": "groq",
+      "name": "Groq Llama 3.3 70B (Tribunal Cloud Ultra-Rápido)",
+      "provider": "openai",
+      "endpoint": "https://api.groq.com/openai/v1/chat/completions",
+      "model": "llama-3.3-70b-versatile",
+      "api_key_env": "GROQ_API_KEY"
+    },
+    {
+      "id": "cerebras",
+      "name": "Cerebras Llama 3.3 70B (Generación Código a 1800 t/s)",
+      "provider": "openai",
+      "endpoint": "https://api.cerebras.ai/v1/chat/completions",
+      "model": "llama-3.3-70b",
+      "api_key_env": "CEREBRAS_API_KEY"
+    },
+    {
+      "id": "gemini",
+      "name": "Google Gemini 2.5 Flash (Contexto Gigante 1M tokens)",
+      "provider": "openai",
+      "endpoint": "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+      "model": "gemini-2.5-flash",
+      "api_key_env": "GEMINI_API_KEY"
+    },
+    {
+      "id": "openrouter-free",
+      "name": "OpenRouter Qwen 2.5 Coder 32B (Cloud Freemium)",
+      "provider": "openai",
+      "endpoint": "https://openrouter.ai/api/v1/chat/completions",
+      "model": "qwen/qwen-2.5-coder-32b-instruct:free",
+      "api_key_env": "OPENROUTER_API_KEY"
+    }
+  ]
+}
